@@ -79,6 +79,9 @@ class CellInfo(BaseModel):
     effective_value: Any | None = None
     is_formula: bool = False
     needs_semantic_translation: bool = False
+    row_span: int = 1
+    col_span: int = 1
+    is_merge_shadow: bool = False
 
     def display_text(self) -> str:
         """Format value for user or LLM presentation."""
@@ -113,6 +116,7 @@ class SheetInspection(BaseModel):
     cells: list[CellInfo] = Field(default_factory=list)
     cells_by_coordinate: dict[str, CellInfo] = Field(default_factory=dict)
     images: list[SheetImage] = Field(default_factory=list)
+    merge_ranges: list[str] = Field(default_factory=list)
 
     def get_cell(self, coordinate: str) -> CellInfo | None:
         """Get cell by coordinate (e.g. 'A1')."""
@@ -120,30 +124,22 @@ class SheetInspection(BaseModel):
 
     def to_matrix(self) -> list[list[str]]:
         """Convert sheet cells to a 2D matrix of display values."""
-        if not self.cells:
+        non_shadow = [c for c in self.cells if not c.is_merge_shadow]
+        if not non_shadow:
             return []
-        max_row = max(c.row for c in self.cells)
-        max_col = max(c.col for c in self.cells)
+        max_row = max(c.row for c in non_shadow)
+        max_col = max(c.col for c in non_shadow)
         matrix = [["" for _ in range(max_col)] for _ in range(max_row)]
-        for c in self.cells:
+        for c in non_shadow:
             matrix[c.row - 1][c.col - 1] = c.display_text()
         return matrix
 
     def to_markdown_table(self) -> str:
         """Convert sheet to standard markdown table, omitting fully empty rows."""
-        matrix = self.to_matrix()
-        if not matrix:
+        sections = render_cells_to_markdown(self.cells)
+        if not sections:
             return f"*(Empty sheet: {self.name})*"
-        header = matrix[0]
-        rows = matrix[1:] if len(matrix) > 1 else []
-        md_lines = [
-            f"| {' | '.join(header)} |",
-            f"| {' | '.join(['---'] * len(header))} |",
-        ]
-        for row in rows:
-            if any(cell.strip() for cell in row):
-                md_lines.append(f"| {' | '.join(row)} |")
-        return "\n".join(md_lines)
+        return "\n\n".join(sections)
 
     def to_row_ordered_blocks(self) -> list[tuple[str, list[CellInfo] | SheetImage]]:
         """Group sheet contents into chronological row-ordered blocks (cells vs images).
@@ -184,9 +180,56 @@ class SheetInspection(BaseModel):
         return blocks
 
 
+def split_title_rows(cells: list[CellInfo]) -> tuple[list[CellInfo], list[CellInfo]]:
+    """Separate leading merged title cells or banner rows from the data table."""
+    if not cells:
+        return [], cells
+
+    non_shadow = [c for c in cells if not c.is_merge_shadow]
+    non_empty = [c for c in non_shadow if c.display_text().strip()]
+    if not non_empty:
+        return [], cells
+
+    distinct_rows = sorted({c.row for c in non_empty})
+    if len(distinct_rows) < 2:
+        return [], cells
+
+    title_cells: list[CellInfo] = []
+    title_rows: set[int] = set()
+
+    for idx, r in enumerate(distinct_rows):
+        # Only inspect contiguous leading rows as titles
+        if idx > 0 and (distinct_rows[idx - 1] not in title_rows):
+            break
+
+        row_text_cells = [c for c in non_empty if c.row == r]
+        # A title row has exactly 1 text cell that spans multiple columns (or is at col 1)
+        # while the next row has multiple header columns
+        if len(row_text_cells) == 1:
+            candidate = row_text_cells[0]
+            remaining_rows = [dr for dr in distinct_rows if dr > r]
+            if not remaining_rows:
+                break
+            next_row_cells = [c for c in non_empty if c.row == remaining_rows[0]]
+
+            # Condition: it is explicitly a merged cell (col_span > 1) or a banner over multiple columns
+            if candidate.col_span > 1 or (len(next_row_cells) >= 2 and candidate.col == 1):
+                title_cells.append(candidate)
+                title_rows.add(r)
+                continue
+        break
+
+    if not title_cells:
+        return [], cells
+
+    data_cells = [c for c in cells if c.row not in title_rows]
+    return title_cells, data_cells
+
+
 def cells_to_markdown_table(cells: list[CellInfo]) -> str:
     """Format an arbitrary subset of cells into a clean Markdown table."""
-    non_empty = [c for c in cells if c.display_text().strip()]
+    non_shadow = [c for c in cells if not c.is_merge_shadow]
+    non_empty = [c for c in non_shadow if c.display_text().strip()]
     if not non_empty:
         return ""
 
@@ -222,6 +265,68 @@ def cells_to_markdown_table(cells: list[CellInfo]) -> str:
         if any(v.strip() for v in r_vals):
             md_lines.append(f"| {' | '.join(r_vals)} |")
     return "\n".join(md_lines)
+
+
+def render_cells_to_markdown(cells: list[CellInfo]) -> list[str]:
+    """Render cells into a clean sequence of markdown headers and tables.
+
+    Extracts merged title and banner rows as markdown headers to avoid empty ||||| columns.
+    """
+    if not cells:
+        return []
+
+    title_cells, data_cells = split_title_rows(cells)
+    sections: list[str] = []
+
+    for tc in title_cells:
+        txt = tc.display_text().strip()
+        if txt:
+            sections.append(f"### {txt}")
+
+    non_shadow = [c for c in data_cells if not c.is_merge_shadow]
+    non_empty = [c for c in non_shadow if c.display_text().strip()]
+    if not non_empty:
+        return sections
+
+    distinct_rows = sorted({c.row for c in non_empty})
+
+    # Check for interior banner rows (a single text cell with col_span > 1 separating sub-tables)
+    has_interior_banner = any(
+        len([c for c in non_empty if c.row == r]) == 1
+        and any(c.col_span > 1 for c in non_empty if c.row == r)
+        for r in distinct_rows[1:]
+    )
+
+    if not has_interior_banner:
+        table_md = cells_to_markdown_table(data_cells)
+        if table_md.strip():
+            sections.append(table_md)
+        return sections
+
+    # Partition data_cells into sub-tables around interior banners
+    current_chunk: list[CellInfo] = []
+    for r in distinct_rows:
+        row_cells = [c for c in non_empty if c.row == r]
+        if len(row_cells) == 1 and row_cells[0].col_span > 1:
+            # Flush current chunk to table
+            if current_chunk:
+                table_md = cells_to_markdown_table(current_chunk)
+                if table_md.strip():
+                    sections.append(table_md)
+                current_chunk = []
+            # Emit banner heading
+            banner_txt = row_cells[0].display_text().strip()
+            if banner_txt:
+                sections.append(f"### {banner_txt}")
+        else:
+            current_chunk.extend([c for c in data_cells if c.row == r])
+
+    if current_chunk:
+        table_md = cells_to_markdown_table(current_chunk)
+        if table_md.strip():
+            sections.append(table_md)
+
+    return sections
 
 
 
@@ -602,6 +707,36 @@ def inspect_excel(path_or_stream: Path | BytesIO | str) -> ExcelInspectionResult
             if dim_elem is not None and dim_elem.get("ref"):
                 sheet_inspection.dimension = dim_elem.get("ref")
 
+            # Parse merged cell ranges (<mergeCells><mergeCell ref="A1:D1"/>...</mergeCells>)
+            merge_index: dict[str, tuple[int, int]] = {}
+            shadow_coords: set[str] = set()
+            merge_ranges: list[str] = []
+
+            for mc_elem in root.iter(f"{{{_NS_MAIN}}}mergeCell"):
+                ref = mc_elem.get("ref")
+                if not ref:
+                    continue
+                merge_ranges.append(ref)
+                if ":" in ref:
+                    tl, br = ref.split(":")
+                    try:
+                        tl_col_str, tl_row = split_coordinate(tl)
+                        br_col_str, br_row = split_coordinate(br)
+                        tl_col = col_letter_to_index(tl_col_str)
+                        br_col = col_letter_to_index(br_col_str)
+                        col_span = br_col - tl_col + 1
+                        row_span = br_row - tl_row + 1
+                        merge_index[tl.upper()] = (row_span, col_span)
+                        for r in range(tl_row, br_row + 1):
+                            for c in range(tl_col, br_col + 1):
+                                coord_str = f"{col_index_to_letter(c)}{r}"
+                                if coord_str != tl.upper():
+                                    shadow_coords.add(coord_str)
+                    except Exception as e:
+                        _log.debug("Error parsing mergeCell ref %s: %s", ref, e)
+
+            sheet_inspection.merge_ranges = merge_ranges
+
             # Parse cells in <sheetData>
             for c_elem in root.iter(f"{{{_NS_MAIN}}}c"):
                 coord = c_elem.get("r")
@@ -671,6 +806,10 @@ def inspect_excel(path_or_stream: Path | BytesIO | str) -> ExcelInspectionResult
                     len(formula_text) > 4 or any(fn in formula_text.upper() for fn in ["VLOOKUP", "XLOOKUP", "INDEX", "MATCH", "IF", "PMT", "NPV", "IRR"])
                 )
 
+                coord_upper = coord.upper()
+                row_span, col_span = merge_index.get(coord_upper, (1, 1))
+                is_merge_shadow = coord_upper in shadow_coords
+
                 cell_info = CellInfo(
                     coordinate=coord,
                     col_letter=col_letter,
@@ -683,6 +822,9 @@ def inspect_excel(path_or_stream: Path | BytesIO | str) -> ExcelInspectionResult
                     effective_value=effective_value,
                     is_formula=is_formula,
                     needs_semantic_translation=needs_semantic,
+                    row_span=row_span,
+                    col_span=col_span,
+                    is_merge_shadow=is_merge_shadow,
                 )
 
                 sheet_inspection.cells.append(cell_info)

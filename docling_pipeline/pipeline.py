@@ -26,6 +26,7 @@ from docling_pipeline.spreadsheet.excel_inspector import (
     ExcelInspectionResult,
     cells_to_markdown_table,
     inspect_excel,
+    render_cells_to_markdown,
 )
 from docling_pipeline.spreadsheet.formula_semantic import FormulaSemanticMapper
 from docling_pipeline.triage.pdf_triage import DocumentTriageReport, triage_pdf
@@ -212,9 +213,10 @@ class HybridDocumentPipeline:
             blocks = sheet.to_row_ordered_blocks()
             for block_type, block_data in blocks:
                 if block_type == "cells":
-                    table_md = cells_to_markdown_table(block_data)
-                    if table_md.strip():
-                        sections.append(table_md)
+                    rendered_sections = render_cells_to_markdown(block_data)
+                    for sec in rendered_sections:
+                        if sec.strip():
+                            sections.append(sec)
                 elif block_type == "image":
                     img_coord = block_data.coordinate
                     img_tuple = sheet_img_map.get(img_coord)
