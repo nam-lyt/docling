@@ -9,9 +9,22 @@ and robust timeout/fallback handling.
 from __future__ import annotations
 
 import asyncio
+import base64
 import enum
+import io
+import json
 import logging
+import os
+import re
 from typing import Any, Callable, Coroutine
+from urllib.parse import urlparse
+
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
+
 from PIL import Image as PILImage
 from pydantic import BaseModel, Field
 
@@ -93,6 +106,9 @@ def attach_vlm_result(
         created_by="vlm_hybrid_pipeline",
         text=rendered_text,
     )
+    if picture.meta and picture.meta.description:                                                                                                                                                                                                    
+        print(picture.meta.description.created_by)  # Prints: "vlm_hybrid_pipeline"                                                                                                                                                                  
+        print(picture.meta.description.confidence) 
 
     # 2. Add DescriptionAnnotation for backward compatibility
     try:
@@ -160,110 +176,278 @@ def export_hybrid_markdown(
     return "\n\n".join(part for part in rendered_parts if part.strip())
 
 
-class AsyncVLMWorkerPool:
-    """Async worker pool for VLM requests with bounded concurrency and timeout.
+def _normalize_chat_endpoint(url: str) -> str:
+    """Normalize a server URL to an OpenAI-compatible /v1/chat/completions endpoint."""
+    cleaned = url.strip().rstrip("/")
+    if cleaned.endswith("/chat/completions"):
+        return cleaned
+    if cleaned.endswith("/v1"):
+        return f"{cleaned}/chat/completions"
+    parsed = urlparse(cleaned)
+    if parsed.path in ("", "/"):
+        return f"{cleaned}/v1/chat/completions"
+    return cleaned
 
+
+class AsyncVLMWorkerPool:
+    """Async worker pool for local VLM / vLLM requests with bounded concurrency and timeout.
+
+    Connects to a local or self-hosted VLM instance (e.g. vLLM server, Ollama, LM Studio,
+    or any OpenAI-compatible Vision endpoint) with robust fallback handling.
     Prevents pipeline starvation when documents contain dozens of images.
     """
 
     def __init__(
         self,
-        max_concurrency: int = 3,
-        timeout_seconds: float = 10.0,
+        server_url: str | None = None,
+        model_name: str | None = None,
+        api_key: str | None = None,
+        max_concurrency: int | None = None,
+        timeout_seconds: float | None = None,
+        max_image_dim: int | None = None,
         vlm_caller: Callable[[PILImage.Image, str], Coroutine[Any, Any, VLMProcessResult]] | None = None,
     ) -> None:
-        self.semaphore = asyncio.Semaphore(max_concurrency)
-        self.timeout = timeout_seconds
-        self.vlm_caller = vlm_caller or self._default_mock_caller
+        # Concurrency limit
+        if max_concurrency is not None:
+            self.max_concurrency = max_concurrency
+        else:
+            try:
+                self.max_concurrency = int(
+                    os.environ.get("VLM_MAX_CONCURRENCY")
+                    or os.environ.get("VLM_CONCURRENCY")
+                    or "1"
+                )
+            except ValueError:
+                self.max_concurrency = 1
+        self.semaphore = asyncio.Semaphore(self.max_concurrency)
 
-    async def _default_mock_caller(self, image: PILImage.Image, element_id: str) -> VLMProcessResult:
-        """Call live VLM API (Gemini/OpenAI) if API key is present, otherwise use heuristic classification."""
-        import base64
-        import io
-        import json
-        import os
+        # Timeout limit
+        if timeout_seconds is not None:
+            self.timeout = timeout_seconds
+        else:
+            try:
+                self.timeout = float(os.environ.get("VLM_TIMEOUT", "60.0"))
+            except ValueError:
+                self.timeout = 60.0
+
+        # Max image dimension for vision context protection
+        if max_image_dim is not None:
+            self.max_image_dim = max_image_dim
+        else:
+            try:
+                self.max_image_dim = int(os.environ.get("VLM_MAX_DIM", "1024"))
+            except ValueError:
+                self.max_image_dim = 1024
+
+        # Configure local VLM / vLLM server parameters
+        if server_url is not None:
+            raw_url = server_url
+        else:
+            raw_url = (
+                os.environ.get("VLLM_SERVER_URL")
+                or os.environ.get("VLM_SERVER_URL")
+                or os.environ.get("LOCAL_VLM_URL")
+                or os.environ.get("OPENAI_BASE_URL")
+                or ""
+            )
+        self.server_url = _normalize_chat_endpoint(raw_url) if raw_url else ""
+        self.model_name = (
+            model_name
+            or os.environ.get("VLLM_MODEL")
+            or os.environ.get("VLM_MODEL")
+            or os.environ.get("OPENAI_MODEL")
+            or "Qwen/Qwen2-VL-7B-Instruct"
+        )
+        self.api_key = (
+            api_key
+            or os.environ.get("VLLM_API_KEY")
+            or os.environ.get("VLM_API_KEY")
+            or os.environ.get("OPENAI_API_KEY")
+            or "EMPTY"
+        )
+        self.vlm_caller = vlm_caller or self._default_local_vlm_caller
+        # Backward-compatibility alias
+        self._default_mock_caller = self._default_local_vlm_caller
+
+    async def _default_local_vlm_caller(self, image: PILImage.Image, element_id: str) -> VLMProcessResult:
+        """Call local or self-hosted vLLM / OpenAI-compatible VLM server.
+
+        Falls back to clean heuristic classification if the server is offline or unreachable.
+        """
+        if not self.server_url:
+            return self._heuristic_fallback(image, element_id)
+
         import httpx
+
+        # Downscale large image to prevent exceeding token context limit in vision models
+        max_dim = self.max_image_dim
+        w, h = image.size
+        if max(w, h) > max_dim:
+            scale = max_dim / max(w, h)
+            proc_img = image.resize((int(w * scale), int(h * scale)), PILImage.Resampling.LANCZOS)
+        else:
+            proc_img = image
 
         # Convert image to base64 JPEG
         buffered = io.BytesIO()
-        rgb_image = image.convert("RGB")
+        rgb_image = proc_img.convert("RGB")
         rgb_image.save(buffered, format="JPEG", quality=85)
         img_b64 = base64.b64encode(buffered.getvalue()).decode("utf-8")
 
         prompt_text = (
-            "Analyze this document image. Classify it into one of: 'flowchart_diagram', 'chart', 'table_image', 'equation_image', or 'other'.\n"
+            "Transcribe this document image faithfully.\n"
+            "- If it contains a table, spreadsheet, or report: convert all rows and columns into a clean Markdown table.\n"
             "- If it is a flowchart or process diagram: generate Mermaid syntax starting with ```mermaid and ending with ```.\n"
-            "- If it is a chart or data table: convert the values into a clean Markdown table and provide a 1-sentence business insight.\n"
-            "- If other: provide a concise 1-sentence description.\n"
-            "Return a JSON object with keys: classification, mermaid_code, markdown_table, business_insight, description."
+            "- If it contains equations: convert to LaTeX $...$.\n"
+            "- If it is text or a document: extract all text cleanly.\n"
+            "Do not add speculative commentary or invented insights."
         )
 
-        gemini_key = os.environ.get("GEMINI_API_KEY")
-        if gemini_key:
-            try:
-                url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={gemini_key}"
-                payload = {
-                    "contents": [
+        payload = {
+            "model": self.model_name,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": prompt_text},
                         {
-                            "parts": [
-                                {"text": prompt_text},
-                                {
-                                    "inline_data": {
-                                        "mime_type": "image/jpeg",
-                                        "data": img_b64,
-                                    }
-                                },
-                            ]
-                        }
+                            "type": "image_url",
+                            "image_url": {
+                                "url": f"data:image/jpeg;base64,{img_b64}"
+                            },
+                        },
                     ],
-                    "generationConfig": {"response_mime_type": "application/json"},
                 }
-                async with httpx.AsyncClient(timeout=self.timeout) as client:
-                    resp = await client.post(url, json=payload)
-                    if resp.status_code == 200:
-                        data = resp.json()
-                        text_resp = data["candidates"][0]["content"]["parts"][0]["text"]
-                        parsed = json.loads(text_resp)
-                        cls_str = parsed.get("classification", "other").lower()
-                        label = VLMClassificationLabel.OTHER
-                        if "flowchart" in cls_str or "diagram" in cls_str:
-                            label = VLMClassificationLabel.FLOWCHART_DIAGRAM
-                        elif "chart" in cls_str:
-                            label = VLMClassificationLabel.CHART
-                        elif "table" in cls_str:
-                            label = VLMClassificationLabel.TABLE_IMAGE
+            ],
+            "max_tokens": 1024,
+            "temperature": 0.0,
+        }
 
-                        return VLMProcessResult(
-                            element_id=element_id,
-                            classification=label,
-                            mermaid_code=parsed.get("mermaid_code"),
-                            markdown_table=parsed.get("markdown_table"),
-                            business_insight=parsed.get("business_insight"),
-                            raw_explanation=parsed.get("description", "VLM analyzed image"),
-                            confidence=0.95,
-                        )
-            except Exception as e:
-                _log.warning(f"Live Gemini VLM call failed ({e}), falling back to heuristic")
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {self.api_key}",
+        }
 
-        # Heuristic fallback based on aspect ratio and dimensions
+        try:
+            async with httpx.AsyncClient(timeout=self.timeout) as client:
+                resp = await client.post(self.server_url, json=payload, headers=headers)
+                if resp.status_code == 200:
+                    data = resp.json()
+                    choices = data.get("choices", [])
+                    if choices:
+                        raw_content = choices[0].get("message", {}).get("content", "")
+                        return self._parse_vlm_output(raw_content, element_id)
+                else:
+                    _log.warning(
+                        f"Local VLM server returned HTTP {resp.status_code}: {resp.text[:200]}"
+                    )
+        except Exception as e:
+            _log.debug(
+                f"Local VLM server request to {self.server_url} failed ({e}), using heuristic fallback"
+            )
+
+        return self._heuristic_fallback(image, element_id)
+
+    def _parse_vlm_output(self, raw_content: str, element_id: str) -> VLMProcessResult:
+        """Parse structured fields from local VLM response (JSON or Markdown-embedded)."""
+        text = raw_content.strip()
+        parsed: dict[str, Any] = {}
+
+        # 1. Try extracting JSON if wrapped in markdown code fence: ```json ... ``` or ``` ... ```
+        json_match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL)
+        if json_match:
+            try:
+                parsed = json.loads(json_match.group(1))
+            except Exception:
+                pass
+
+        # 2. Try parsing entire text as direct JSON
+        if not parsed:
+            try:
+                parsed = json.loads(text)
+            except Exception:
+                # Try finding first { and last }
+                start = text.find("{")
+                end = text.rfind("}")
+                if start != -1 and end != -1 and end > start:
+                    try:
+                        parsed = json.loads(text[start : end + 1])
+                    except Exception:
+                        pass
+
+        if parsed and isinstance(parsed, dict):
+            cls_str = str(parsed.get("classification", "other")).lower()
+            label = VLMClassificationLabel.OTHER
+            if "flowchart" in cls_str or "diagram" in cls_str:
+                label = VLMClassificationLabel.FLOWCHART_DIAGRAM
+            elif "chart" in cls_str:
+                label = VLMClassificationLabel.CHART
+            elif "table" in cls_str:
+                label = VLMClassificationLabel.TABLE_IMAGE
+            elif "equation" in cls_str or "math" in cls_str:
+                label = VLMClassificationLabel.EQUATION_IMAGE
+
+            return VLMProcessResult(
+                element_id=element_id,
+                classification=label,
+                mermaid_code=parsed.get("mermaid_code"),
+                markdown_table=parsed.get("markdown_table"),
+                latex_equation=parsed.get("latex_equation"),
+                business_insight=parsed.get("business_insight"),
+                raw_explanation=parsed.get("description") or parsed.get("raw_explanation") or "Local VLM analyzed image",
+                confidence=0.95,
+            )
+
+        # 3. If not strict JSON, extract markdown structures directly
+        mermaid_match = re.search(r"```mermaid\s*(.*?)\s*```", text, re.DOTALL)
+        if mermaid_match:
+            return VLMProcessResult(
+                element_id=element_id,
+                classification=VLMClassificationLabel.FLOWCHART_DIAGRAM,
+                mermaid_code=mermaid_match.group(1).strip(),
+                raw_explanation="Flowchart diagram generated by local VLM",
+                confidence=0.90,
+            )
+
+        # Check for markdown table
+        lines = [line.strip() for line in text.splitlines() if line.strip()]
+        table_lines = [line for line in lines if line.startswith("|") and line.endswith("|")]
+        if len(table_lines) >= 2:
+            return VLMProcessResult(
+                element_id=element_id,
+                classification=VLMClassificationLabel.TABLE_IMAGE,
+                markdown_table="\n".join(table_lines),
+                raw_explanation="Table extracted by local VLM",
+                confidence=0.90,
+            )
+
+        return VLMProcessResult(
+            element_id=element_id,
+            classification=VLMClassificationLabel.OTHER,
+            raw_explanation=text or "Local VLM analyzed image",
+            confidence=0.85,
+        )
+
+    def _heuristic_fallback(self, image: PILImage.Image, element_id: str) -> VLMProcessResult:
+        """Clean heuristic fallback when server is offline - does NOT invent fake tables or insights."""
         w, h = image.size
         if w > h * 1.5:  # Wide -> typical flowchart / architecture diagram
             return VLMProcessResult(
                 element_id=element_id,
                 classification=VLMClassificationLabel.FLOWCHART_DIAGRAM,
-                mermaid_code="flowchart LR\n    Input([Input Data]) --> Process[Processing Engine] --> Output([Output Result])",
-                business_insight="Standard execution sequence workflow.",
-                raw_explanation="Horizontal process diagram.",
-                confidence=0.90,
+                mermaid_code=None,
+                business_insight=None,
+                raw_explanation="",
+                confidence=0.5,
             )
         else:  # Square/vertical -> typical chart or table
             return VLMProcessResult(
                 element_id=element_id,
                 classification=VLMClassificationLabel.CHART,
-                markdown_table="| Category | Value |\n| --- | --- |\n| Q1 | 120 |\n| Q2 | 180 |\n| Q3 | 240 |",
-                business_insight="Quarterly performance shows steady 30%+ QoQ growth.",
-                raw_explanation="Quarterly metric comparison bar chart.",
-                confidence=0.90,
+                markdown_table=None,
+                business_insight=None,
+                raw_explanation="",
+                confidence=0.5,
             )
 
     async def process_image_with_fallback(
@@ -275,10 +459,12 @@ class AsyncVLMWorkerPool:
         """Process a single image within semaphore and timeout guards."""
         async with self.semaphore:
             try:
-                return await asyncio.wait_for(
+                result = await asyncio.wait_for(
                     self.vlm_caller(image, element_id),
                     timeout=self.timeout,
                 )
+                if result is not None:
+                    return result
             except asyncio.TimeoutError:
                 _log.warning(f"VLM processing timed out for {element_id} after {self.timeout}s; using fallback")
                 return VLMProcessResult(
@@ -289,12 +475,8 @@ class AsyncVLMWorkerPool:
                 )
             except Exception as e:
                 _log.warning(f"VLM processing error for {element_id}: {e}; using fallback")
-                return VLMProcessResult(
-                    element_id=element_id,
-                    classification=VLMClassificationLabel.OTHER,
-                    raw_explanation=f"{fallback_description} (Error: {e})",
-                    confidence=0.5,
-                )
+
+            return self._heuristic_fallback(image, element_id)
 
     async def process_batch(
         self,
@@ -310,4 +492,4 @@ class AsyncVLMWorkerPool:
             for img, el_id, fallback in items
         ]
         results = await asyncio.gather(*tasks)
-        return {r.element_id: r for r in results}
+        return {r.element_id: r for r in results if r is not None}

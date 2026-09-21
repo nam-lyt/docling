@@ -14,6 +14,12 @@ from docling_pipeline.tools.mcp_tool import (
     triage_pdf_document,
 )
 
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
+
 
 def main() -> None:
     # Ensure UTF-8 output on Windows console to avoid charmap encoding errors with Vietnamese/Unicode
@@ -56,6 +62,43 @@ def main() -> None:
         action="store_true",
         help="Start the FastMCP server for AI agents and LLM tool calls.",
     )
+    parser.add_argument(
+        "--vlm-url",
+        help="URL of local or self-hosted VLM/vLLM server (e.g. http://localhost:8000/v1/chat/completions).",
+    )
+    parser.add_argument(
+        "--vlm-model",
+        help="Model name for local VLM/vLLM server (e.g. Qwen/Qwen2-VL-7B-Instruct).",
+    )
+    parser.add_argument(
+        "--no-vlm",
+        action="store_true",
+        help="Disable VLM visual processing entirely (use clean image placeholders).",
+    )
+    parser.add_argument(
+        "--concurrency",
+        "--vlm-concurrency",
+        type=int,
+        default=None,
+        dest="vlm_concurrency",
+        help="Maximum concurrent async requests to VLM server (default: 1 or VLM_MAX_CONCURRENCY).",
+    )
+    parser.add_argument(
+        "--timeout",
+        "--vlm-timeout",
+        type=float,
+        default=None,
+        dest="vlm_timeout",
+        help="Timeout in seconds per VLM request (default: 60.0 or VLM_TIMEOUT).",
+    )
+    parser.add_argument(
+        "--vlm-dim",
+        "--vlm-max-dim",
+        type=int,
+        default=None,
+        dest="vlm_max_dim",
+        help="Maximum image dimension for vision model downscaling (default: 1024 or VLM_MAX_DIM).",
+    )
 
     args = parser.parse_args()
 
@@ -93,7 +136,14 @@ def main() -> None:
 
     # 4. Standard Hybrid Pipeline Processing
     print(f"[*] Processing document with Docling Hybrid Pipeline: {target_path.name}...")
-    pipeline = HybridDocumentPipeline()
+    pipeline = HybridDocumentPipeline(
+        vlm_server_url=args.vlm_url,
+        vlm_model=args.vlm_model,
+        vlm_concurrency=args.vlm_concurrency,
+        vlm_timeout=args.vlm_timeout,
+        vlm_max_dim=args.vlm_max_dim,
+        enable_vlm=not args.no_vlm,
+    )
     result = pipeline.process(target_path)
 
     print(f"[+] Completed in {result.processing_time_seconds}s (Format: {result.file_format.upper()})")

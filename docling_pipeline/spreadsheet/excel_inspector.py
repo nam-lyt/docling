@@ -145,6 +145,85 @@ class SheetInspection(BaseModel):
                 md_lines.append(f"| {' | '.join(row)} |")
         return "\n".join(md_lines)
 
+    def to_row_ordered_blocks(self) -> list[tuple[str, list[CellInfo] | SheetImage]]:
+        """Group sheet contents into chronological row-ordered blocks (cells vs images).
+
+        Returns a list of tuples:
+        - ("cells", list_of_cells)
+        - ("image", sheet_image)
+        """
+        if not self.images:
+            return [("cells", self.cells)] if self.cells else []
+
+        sorted_images = sorted(self.images, key=lambda im: (im.row, im.col))
+        sorted_cells = sorted(self.cells, key=lambda c: (c.row, c.col))
+
+        blocks: list[tuple[str, list[CellInfo] | SheetImage]] = []
+        cell_idx = 0
+        n_cells = len(sorted_cells)
+
+        for img in sorted_images:
+            cells_before: list[CellInfo] = []
+            while cell_idx < n_cells:
+                c = sorted_cells[cell_idx]
+                if (c.row < img.row) or (c.row == img.row and c.col < img.col):
+                    cells_before.append(c)
+                    cell_idx += 1
+                else:
+                    break
+
+            if cells_before:
+                blocks.append(("cells", cells_before))
+
+            blocks.append(("image", img))
+
+        cells_after = sorted_cells[cell_idx:]
+        if cells_after:
+            blocks.append(("cells", cells_after))
+
+        return blocks
+
+
+def cells_to_markdown_table(cells: list[CellInfo]) -> str:
+    """Format an arbitrary subset of cells into a clean Markdown table."""
+    non_empty = [c for c in cells if c.display_text().strip()]
+    if not non_empty:
+        return ""
+
+    active_cols = sorted({c.col for c in non_empty})
+    distinct_rows = sorted({c.row for c in non_empty})
+    cell_map = {(c.row, c.col): c.display_text() for c in non_empty}
+
+    grid: list[list[str]] = []
+    for r in distinct_rows:
+        row_vals = [cell_map.get((r, c_idx), "") for c_idx in active_cols]
+        grid.append(row_vals)
+
+    if not grid:
+        return ""
+
+    # If only 1 row
+    if len(grid) == 1:
+        first_row = grid[0]
+        if len(first_row) == 1:
+            return first_row[0]
+        return (
+            f"| {' | '.join(first_row)} |\n"
+            f"| {' | '.join(['---'] * len(first_row))} |"
+        )
+
+    header = grid[0]
+    data_rows = grid[1:]
+    md_lines = [
+        f"| {' | '.join(header)} |",
+        f"| {' | '.join(['---'] * len(header))} |",
+    ]
+    for r_vals in data_rows:
+        if any(v.strip() for v in r_vals):
+            md_lines.append(f"| {' | '.join(r_vals)} |")
+    return "\n".join(md_lines)
+
+
 
 class ExcelInspectionResult(BaseModel):
     """Aggregate result from inspecting an Excel workbook."""

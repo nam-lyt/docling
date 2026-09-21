@@ -24,6 +24,7 @@ from pydantic import BaseModel, Field
 
 from docling_pipeline.spreadsheet.excel_inspector import (
     ExcelInspectionResult,
+    cells_to_markdown_table,
     inspect_excel,
 )
 from docling_pipeline.spreadsheet.formula_semantic import FormulaSemanticMapper
@@ -56,11 +57,22 @@ class HybridDocumentPipeline:
     def __init__(
         self,
         vlm_pool: AsyncVLMWorkerPool | None = None,
+        vlm_server_url: str | None = None,
+        vlm_model: str | None = None,
+        vlm_concurrency: int | None = None,
+        vlm_timeout: float | None = None,
+        vlm_max_dim: int | None = None,
         min_pdf_vector_chars: int = 50,
         enable_formula_semantics: bool = True,
         enable_vlm: bool = True,
     ) -> None:
-        self.vlm_pool = vlm_pool or AsyncVLMWorkerPool()
+        self.vlm_pool = vlm_pool or AsyncVLMWorkerPool(
+            server_url=vlm_server_url,
+            model_name=vlm_model,
+            max_concurrency=vlm_concurrency,
+            timeout_seconds=vlm_timeout,
+            max_image_dim=vlm_max_dim,
+        )
         self.min_pdf_vector_chars = min_pdf_vector_chars
         self.enable_formula_semantics = enable_formula_semantics
         self.enable_vlm = enable_vlm
@@ -76,6 +88,9 @@ class HybridDocumentPipeline:
 
     def _enhance_pictures_with_vlm(self, doc: DoclingDocument) -> int:
         """Inspect all PictureItems, skip icons < 100x100, and enhance candidates with VLM."""
+        if not self.enable_vlm:
+            return 0
+
         import asyncio
         from docling_core.types.doc import PictureItem
         from docling_pipeline.vlm.annotation_hook import attach_vlm_result
@@ -152,23 +167,22 @@ class HybridDocumentPipeline:
 
         for sheet in inspection.sheets:
             sections.append(f"\n## Sheet: {sheet.name}")
-            sections.append(sheet.to_markdown_table())
 
-            # 1. Embedded images & visual elements
-            if sheet.images:
-                sections.append("\n### 🖼️ Embedded Images & Visual Elements")
-                vlm_batch: list[tuple[PILImage.Image, str, str]] = []
-                sheet_img_items: list[tuple[Any, PILImage.Image, str]] = []
+            # 1. Prepare embedded images, raw bytes, and candidate VLM batch
+            sheet_img_map: dict[str, tuple[Any, PILImage.Image, str]] = {}
+            vlm_batch: list[tuple[PILImage.Image, str, str]] = []
 
-                for img_item in sheet.images:
-                    if img_item.raw_bytes:
-                        img_filename = f"{stem}_{sheet.name}_{img_item.coordinate}.png"
-                        rel_img_path = f"images/{img_filename}"
-                        extracted_images[rel_img_path] = img_item.raw_bytes
+            for img_item in sheet.images:
+                if img_item.raw_bytes:
+                    img_filename = f"{stem}_{sheet.name}_{img_item.coordinate}.png"
+                    rel_img_path = f"images/{img_filename}"
+                    extracted_images[rel_img_path] = img_item.raw_bytes
 
-                        try:
-                            pil_img = PILImage.open(BytesIO(img_item.raw_bytes))
-                            sheet_img_items.append((img_item, pil_img, rel_img_path))
+                    try:
+                        pil_img = PILImage.open(BytesIO(img_item.raw_bytes))
+                        sheet_img_map[img_item.coordinate] = (img_item, pil_img, rel_img_path)
+                        # Heuristic: skip icons/decorations < 100x100 px from VLM
+                        if pil_img.width >= 100 and pil_img.height >= 100:
                             vlm_batch.append(
                                 (
                                     pil_img,
@@ -176,39 +190,59 @@ class HybridDocumentPipeline:
                                     f"Embedded visual in sheet '{sheet.name}' at cell {img_item.coordinate} ({img_item.width}x{img_item.height})",
                                 )
                             )
-                        except Exception as e:
-                            _log.warning(
-                                "Could not open embedded image at %s: %s",
-                                img_item.coordinate,
-                                e,
-                            )
-
-                vlm_results: dict[str, Any] = {}
-                if self.enable_vlm and vlm_batch:
-                    try:
-                        vlm_results = asyncio.run(
-                            self.vlm_pool.process_batch(vlm_batch)
-                        )
                     except Exception as e:
                         _log.warning(
-                            "VLM processing error for spreadsheet images: %s", e
+                            "Could not open embedded image at %s: %s",
+                            img_item.coordinate,
+                            e,
                         )
 
-                for img_item, _pil_img, rel_img_path in sheet_img_items:
-                    # Placeholders: Docling image comment, explicit placeholder tag, and standard markdown image syntax
-                    sections.append(f"<!-- image: {img_item.coordinate} -->")
-                    sections.append(
-                        f"<!-- {{placeholder: {sheet.name}_{img_item.coordinate}}} -->"
+            vlm_results: dict[str, Any] = {}
+            if self.enable_vlm and vlm_batch:
+                try:
+                    vlm_results = asyncio.run(
+                        self.vlm_pool.process_batch(vlm_batch)
                     )
-                    sections.append(
-                        f"![Image at cell {img_item.coordinate} ({img_item.width}x{img_item.height})]({rel_img_path})"
+                except Exception as e:
+                    _log.warning(
+                        "VLM processing error for spreadsheet images: %s", e
                     )
 
-                    vlm_res = vlm_results.get(img_item.coordinate)
-                    if vlm_res:
+            # 2. Render sheet content with chronological row-interleaving
+            blocks = sheet.to_row_ordered_blocks()
+            for block_type, block_data in blocks:
+                if block_type == "cells":
+                    table_md = cells_to_markdown_table(block_data)
+                    if table_md.strip():
+                        sections.append(table_md)
+                elif block_type == "image":
+                    img_coord = block_data.coordinate
+                    img_tuple = sheet_img_map.get(img_coord)
+                    rel_img_path = (
+                        img_tuple[2]
+                        if img_tuple
+                        else f"images/{stem}_{sheet.name}_{img_coord}.png"
+                    )
+
+                    vlm_res = vlm_results.get(img_coord)
+                    if (
+                        vlm_res
+                        and (
+                            vlm_res.markdown_table
+                            or vlm_res.mermaid_code
+                            or vlm_res.latex_equation
+                        )
+                        and vlm_res.confidence >= 0.8
+                    ):
+                        # True VLM extraction: replace image directly with structured content without redundant comments
                         sections.append(vlm_res.render_markdown())
+                    else:
+                        # Clean fallback: emit standard image link, NO FAKE TEXT!
+                        sections.append(
+                            f"![Image at cell {img_coord} ({block_data.width}x{block_data.height})]({rel_img_path})"
+                        )
 
-            # 2. Formula Logic & Semantic Context
+            # 3. Formula Logic & Semantic Context
             if self.enable_formula_semantics and sheet.formula_cells_count > 0:
                 prompt_container = FormulaSemanticMapper.map_sheet_formulas(sheet)
                 total_formula_contexts += len(prompt_container.contexts)
