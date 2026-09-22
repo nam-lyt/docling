@@ -79,7 +79,7 @@ class VLMProcessResult(BaseModel):
             clean_eq = self.latex_equation.strip().strip("$")
             blocks.append(f"$${clean_eq}$$")
         else:
-            blocks.append(f"> **[Image Analysis]**: {self.raw_explanation}")
+            blocks.append(self.raw_explanation)
 
         if self.business_insight:
             blocks.append(f"> 💡 **Key Insight**: {self.business_insight.strip()}")
@@ -190,11 +190,9 @@ def _normalize_chat_endpoint(url: str) -> str:
 
 
 class AsyncVLMWorkerPool:
-    """Async worker pool for local VLM / vLLM requests with bounded concurrency and timeout.
+    """Async worker pool for local VLM / OpenAI-compatible requests with bounded concurrency and timeout.
 
-    Connects to a local or self-hosted VLM instance (e.g. vLLM server, Ollama, LM Studio,
-    or any OpenAI-compatible Vision endpoint) with robust fallback handling.
-    Prevents pipeline starvation when documents contain dozens of images.
+    Matches test_llm.py calling style directly with trust_env=False (no proxy) and configurable max-time.
     """
 
     def __init__(
@@ -204,8 +202,12 @@ class AsyncVLMWorkerPool:
         api_key: str | None = None,
         max_concurrency: int | None = None,
         timeout_seconds: float | None = None,
+        max_time: float | None = None,
+        max_tokens: int | None = None,
+        temperature: float | None = None,
         max_image_dim: int | None = None,
         vlm_caller: Callable[[PILImage.Image, str], Coroutine[Any, Any, VLMProcessResult]] | None = None,
+        **kwargs: Any,
     ) -> None:
         # Concurrency limit
         if max_concurrency is not None:
@@ -221,14 +223,45 @@ class AsyncVLMWorkerPool:
                 self.max_concurrency = 1
         self.semaphore = asyncio.Semaphore(self.max_concurrency)
 
-        # Timeout limit
-        if timeout_seconds is not None:
-            self.timeout = timeout_seconds
+        # Timeout limit (--max-time, default 600.0s)
+        effective_timeout = max_time if max_time is not None else timeout_seconds
+        if effective_timeout is not None:
+            self.timeout = float(effective_timeout)
         else:
             try:
-                self.timeout = float(os.environ.get("VLM_TIMEOUT", "60.0"))
+                self.timeout = float(
+                    os.environ.get("VLM_MAX_TIME")
+                    or os.environ.get("VLM_TIMEOUT")
+                    or os.environ.get("MAX_TIME")
+                    or "600.0"
+                )
             except ValueError:
-                self.timeout = 60.0
+                self.timeout = 600.0
+
+        # Max tokens and temperature
+        if max_tokens is not None:
+            self.max_tokens = max_tokens
+        else:
+            try:
+                self.max_tokens = int(
+                    os.environ.get("VLM_MAX_TOKENS")
+                    or os.environ.get("MAX_TOKENS")
+                    or "4096"
+                )
+            except ValueError:
+                self.max_tokens = 4096
+
+        if temperature is not None:
+            self.temperature = temperature
+        else:
+            try:
+                self.temperature = float(
+                    os.environ.get("VLM_TEMPERATURE")
+                    or os.environ.get("TEMPERATURE")
+                    or "0.0"
+                )
+            except ValueError:
+                self.temperature = 0.0
 
         # Max image dimension for vision context protection
         if max_image_dim is not None:
@@ -239,70 +272,64 @@ class AsyncVLMWorkerPool:
             except ValueError:
                 self.max_image_dim = 1024
 
-        # Configure local VLM / vLLM server parameters
+        # Configure server parameters
         if server_url is not None:
             raw_url = server_url
         else:
             raw_url = (
-                os.environ.get("VLLM_SERVER_URL")
+                os.environ.get("OPENAI_BASE_URL")
+                or os.environ.get("VLLM_SERVER_URL")
                 or os.environ.get("VLM_SERVER_URL")
                 or os.environ.get("LOCAL_VLM_URL")
-                or os.environ.get("OPENAI_BASE_URL")
                 or ""
             )
+
         self.server_url = _normalize_chat_endpoint(raw_url) if raw_url else ""
         self.model_name = (
             model_name
+            or os.environ.get("OPENAI_MODEL")
             or os.environ.get("VLLM_MODEL")
             or os.environ.get("VLM_MODEL")
-            or os.environ.get("OPENAI_MODEL")
-            or "Qwen/Qwen2-VL-7B-Instruct"
+            or "gemma-4-26B"
         )
         self.api_key = (
             api_key
+            or os.environ.get("OPENAI_API_KEY")
             or os.environ.get("VLLM_API_KEY")
             or os.environ.get("VLM_API_KEY")
-            or os.environ.get("OPENAI_API_KEY")
             or "EMPTY"
         )
         self.vlm_caller = vlm_caller or self._default_local_vlm_caller
-        # Backward-compatibility alias
         self._default_mock_caller = self._default_local_vlm_caller
 
     async def _default_local_vlm_caller(self, image: PILImage.Image, element_id: str) -> VLMProcessResult:
-        """Call local or self-hosted vLLM / OpenAI-compatible VLM server.
-
-        Falls back to clean heuristic classification if the server is offline or unreachable.
-        """
+        """Call local or self-hosted OpenAI-compatible VLM server matching test_llm.py."""
         if not self.server_url:
             return self._heuristic_fallback(image, element_id)
 
         import httpx
 
-        # Downscale large image to prevent exceeding token context limit in vision models
-        max_dim = self.max_image_dim
         w, h = image.size
-        if max(w, h) > max_dim:
-            scale = max_dim / max(w, h)
+        # Downscale large image only if max_image_dim is set and image exceeds it
+        if self.max_image_dim and max(w, h) > self.max_image_dim:
+            scale = self.max_image_dim / max(w, h)
             proc_img = image.resize((int(w * scale), int(h * scale)), PILImage.Resampling.LANCZOS)
         else:
             proc_img = image
 
-        # Convert image to base64 JPEG
+        # Encode image to PNG base64 matching test_llm.py (lossless, preserves transparency)
         buffered = io.BytesIO()
-        rgb_image = proc_img.convert("RGB")
-        rgb_image.save(buffered, format="JPEG", quality=85)
+        proc_img.save(buffered, format="PNG")
         img_b64 = base64.b64encode(buffered.getvalue()).decode("utf-8")
+        mime_type = "image/png"
 
-        prompt_text = (
-            "Transcribe this document image faithfully.\n"
-            "- If it contains a table, spreadsheet, or report: convert all rows and columns into a clean Markdown table.\n"
-            "- If it is a flowchart or process diagram: generate Mermaid syntax starting with ```mermaid and ending with ```.\n"
-            "- If it contains equations: convert to LaTeX $...$.\n"
-            "- If it is text or a document: extract all text cleanly.\n"
-            "Do not add speculative commentary or invented insights."
+        # Match prompt in test_llm.py exactly (can be overridden via VLM_PROMPT env var)
+        prompt_text = os.environ.get(
+            "VLM_PROMPT",
+            "Transcribe this image. If it contains a table or diagram, convert to markdown/mermaid.",
         )
 
+        # EXACT payload matching test_llm.py
         payload = {
             "model": self.model_name,
             "messages": [
@@ -313,43 +340,60 @@ class AsyncVLMWorkerPool:
                         {
                             "type": "image_url",
                             "image_url": {
-                                "url": f"data:image/jpeg;base64,{img_b64}"
+                                "url": f"data:{mime_type};base64,{img_b64}"
                             },
                         },
                     ],
                 }
             ],
-            "max_tokens": 1024,
-            "temperature": 0.0,
+            "max_tokens": self.max_tokens,
+            "temperature": self.temperature,
         }
 
-        headers = {
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {self.api_key}",
-        }
+        # Print payload preview (truncating the huge base64 string for readability) matching test_llm.py
+        preview_payload = json.loads(json.dumps(payload))
+        preview_payload["messages"][0]["content"][1]["image_url"]["url"] = (
+            f"data:{mime_type};base64," + img_b64[:30] + "...[truncated]..."
+        )
+        print("\n" + "=" * 60)
+        print(f"🖼️  Image: {element_id} ({w}x{h} px)")
+        print(f"📝 Prompt: {prompt_text}")
+        print("Sending Payload:\n", json.dumps(preview_payload, indent=2))
+
+        headers = {"Content-Type": "application/json"}
+        if self.api_key and self.api_key != "EMPTY":
+            headers["Authorization"] = f"Bearer {self.api_key}"
 
         try:
-            async with httpx.AsyncClient(timeout=self.timeout) as client:
+            # trust_env=False bypasses proxy completely, exactly matching test_llm.py / curl --noproxy
+            async with httpx.AsyncClient(timeout=self.timeout, trust_env=False) as client:
+                print(f"\nCalling {self.server_url} (timeout {self.timeout}s, no proxy)...")
                 resp = await client.post(self.server_url, json=payload, headers=headers)
+
+                print("\nStatus Code:", resp.status_code)
                 if resp.status_code == 200:
-                    data = resp.json()
-                    choices = data.get("choices", [])
-                    if choices:
+                    result = resp.json()
+                    print("\nFull Response JSON:\n", json.dumps(result, indent=2, ensure_ascii=False))
+                    choices = result.get("choices", [])
+                    raw_content = ""
+                    if choices and isinstance(choices, list):
                         raw_content = choices[0].get("message", {}).get("content", "")
+                    print("\n=== Model Output ===\n", raw_content)
+                    print("=" * 60 + "\n")
+
+                    if raw_content:
                         return self._parse_vlm_output(raw_content, element_id)
                 else:
-                    _log.warning(
-                        f"Local VLM server returned HTTP {resp.status_code}: {resp.text[:200]}"
-                    )
+                    print("Error Response:\n", resp.text)
+                    print("=" * 60 + "\n")
         except Exception as e:
-            _log.debug(
-                f"Local VLM server request to {self.server_url} failed ({e}), using heuristic fallback"
-            )
+            print("Request failed:", e)
+            print("=" * 60 + "\n")
 
         return self._heuristic_fallback(image, element_id)
 
     def _parse_vlm_output(self, raw_content: str, element_id: str) -> VLMProcessResult:
-        """Parse structured fields from local VLM response (JSON or Markdown-embedded)."""
+        """Parse structured fields from local VLM response (JSON, Mermaid, Table, or Markdown)."""
         text = raw_content.strip()
         parsed: dict[str, Any] = {}
 
@@ -394,22 +438,22 @@ class AsyncVLMWorkerPool:
                 markdown_table=parsed.get("markdown_table"),
                 latex_equation=parsed.get("latex_equation"),
                 business_insight=parsed.get("business_insight"),
-                raw_explanation=parsed.get("description") or parsed.get("raw_explanation") or "Local VLM analyzed image",
+                raw_explanation=parsed.get("description") or parsed.get("raw_explanation") or text,
                 confidence=0.95,
             )
 
-        # 3. If not strict JSON, extract markdown structures directly
+        # 3. Check for Mermaid diagram
         mermaid_match = re.search(r"```mermaid\s*(.*?)\s*```", text, re.DOTALL)
         if mermaid_match:
             return VLMProcessResult(
                 element_id=element_id,
                 classification=VLMClassificationLabel.FLOWCHART_DIAGRAM,
                 mermaid_code=mermaid_match.group(1).strip(),
-                raw_explanation="Flowchart diagram generated by local VLM",
-                confidence=0.90,
+                raw_explanation=text,
+                confidence=0.95,
             )
 
-        # Check for markdown table
+        # 4. Check for Markdown table
         lines = [line.strip() for line in text.splitlines() if line.strip()]
         table_lines = [line for line in lines if line.startswith("|") and line.endswith("|")]
         if len(table_lines) >= 2:
@@ -417,15 +461,16 @@ class AsyncVLMWorkerPool:
                 element_id=element_id,
                 classification=VLMClassificationLabel.TABLE_IMAGE,
                 markdown_table="\n".join(table_lines),
-                raw_explanation="Table extracted by local VLM",
-                confidence=0.90,
+                raw_explanation=text,
+                confidence=0.95,
             )
 
+        # 5. Direct Markdown / Text transcription
         return VLMProcessResult(
             element_id=element_id,
             classification=VLMClassificationLabel.OTHER,
-            raw_explanation=text or "Local VLM analyzed image",
-            confidence=0.85,
+            raw_explanation=text,
+            confidence=0.95,
         )
 
     def _heuristic_fallback(self, image: PILImage.Image, element_id: str) -> VLMProcessResult:

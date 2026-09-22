@@ -60,8 +60,13 @@ class HybridDocumentPipeline:
         vlm_pool: AsyncVLMWorkerPool | None = None,
         vlm_server_url: str | None = None,
         vlm_model: str | None = None,
+        vlm_api_type: str | None = None,
+        vlm_no_proxy: str | bool | None = None,
         vlm_concurrency: int | None = None,
         vlm_timeout: float | None = None,
+        vlm_max_time: float | None = None,
+        vlm_max_tokens: int | None = None,
+        vlm_temperature: float | None = None,
         vlm_max_dim: int | None = None,
         min_pdf_vector_chars: int = 50,
         enable_formula_semantics: bool = True,
@@ -70,8 +75,13 @@ class HybridDocumentPipeline:
         self.vlm_pool = vlm_pool or AsyncVLMWorkerPool(
             server_url=vlm_server_url,
             model_name=vlm_model,
+            api_type=vlm_api_type,
+            no_proxy=vlm_no_proxy,
             max_concurrency=vlm_concurrency,
             timeout_seconds=vlm_timeout,
+            max_time=vlm_max_time,
+            max_tokens=vlm_max_tokens,
+            temperature=vlm_temperature,
             max_image_dim=vlm_max_dim,
         )
         self.min_pdf_vector_chars = min_pdf_vector_chars
@@ -87,10 +97,10 @@ class HybridDocumentPipeline:
         pdf_format_option = PdfFormatOption(pipeline_options=pipeline_options)
         return DocumentConverter(format_options={InputFormat.PDF: pdf_format_option})
 
-    def _enhance_pictures_with_vlm(self, doc: DoclingDocument) -> int:
+    def _enhance_pictures_with_vlm(self, doc: DoclingDocument) -> tuple[int, dict[str, Any]]:
         """Inspect all PictureItems, skip icons < 100x100, and enhance candidates with VLM."""
         if not self.enable_vlm:
-            return 0
+            return 0, {}
 
         import asyncio
         from docling_core.types.doc import PictureItem
@@ -110,7 +120,7 @@ class HybridDocumentPipeline:
                     _log.debug(f"Could not extract image from PictureItem: {e}")
 
         if not vlm_items:
-            return 0
+            return 0, {}
 
         # Process candidates concurrently with VLM Worker Pool
         vlm_results = asyncio.run(self.vlm_pool.process_batch(vlm_items))
@@ -122,7 +132,7 @@ class HybridDocumentPipeline:
                 attach_vlm_result(doc, item, vlm_results[item.self_ref])
                 enhanced_count += 1
 
-        return enhanced_count
+        return enhanced_count, vlm_results
 
     def process(self, file_path_or_bytes: Path | BytesIO | str, filename: str | None = None) -> ProcessedDocumentResult:
         """Process an input document of any supported format into RAG-ready Markdown."""
@@ -233,6 +243,7 @@ class HybridDocumentPipeline:
                             vlm_res.markdown_table
                             or vlm_res.mermaid_code
                             or vlm_res.latex_equation
+                            or vlm_res.raw_explanation
                         )
                         and vlm_res.confidence >= 0.8
                     ):
@@ -296,10 +307,10 @@ class HybridDocumentPipeline:
         doc = conv_res.document
 
         # Enhance pictures with VLM (converting charts -> tables, flowcharts -> Mermaid)
-        vlm_enhanced_count = self._enhance_pictures_with_vlm(doc)
+        vlm_enhanced_count, vlm_results = self._enhance_pictures_with_vlm(doc)
 
         # Render hybrid markdown (bung Mermaid and tables)
-        full_md = export_hybrid_markdown(doc)
+        full_md = export_hybrid_markdown(doc, vlm_results=vlm_results)
         elapsed = round(time.perf_counter() - start_time, 3)
 
         return ProcessedDocumentResult(
@@ -371,9 +382,9 @@ class HybridDocumentPipeline:
         doc = conv_res.document
 
         # Enhance raster pictures with VLM
-        vlm_enhanced_count = self._enhance_pictures_with_vlm(doc)
+        vlm_enhanced_count, vlm_results = self._enhance_pictures_with_vlm(doc)
 
-        full_md = export_hybrid_markdown(doc)
+        full_md = export_hybrid_markdown(doc, vlm_results=vlm_results)
         elapsed = round(time.perf_counter() - start_time, 3)
 
         return ProcessedDocumentResult(

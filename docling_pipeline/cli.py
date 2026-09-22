@@ -86,10 +86,24 @@ def main() -> None:
     parser.add_argument(
         "--timeout",
         "--vlm-timeout",
+        "--max-time",
         type=float,
         default=None,
         dest="vlm_timeout",
-        help="Timeout in seconds per VLM request (default: 60.0 or VLM_TIMEOUT).",
+        help="Timeout in seconds per VLM request, equivalent to curl --max-time (default: 600.0 or VLM_TIMEOUT).",
+    )
+    parser.add_argument(
+        "--noproxy",
+        "--no-proxy",
+        dest="no_proxy",
+        default=None,
+        help="Bypass proxy for specified host(s) (e.g. '172.16.6.11' or '*') or set True to bypass completely.",
+    )
+    parser.add_argument(
+        "--vlm-api-type",
+        choices=["chat_completions", "responses"],
+        default=None,
+        help="API standard format: 'chat_completions' (OpenAI /v1/chat/completions) or 'responses' (OpenAI /v1/responses).",
     )
     parser.add_argument(
         "--vlm-dim",
@@ -139,6 +153,8 @@ def main() -> None:
     pipeline = HybridDocumentPipeline(
         vlm_server_url=args.vlm_url,
         vlm_model=args.vlm_model,
+        vlm_api_type=args.vlm_api_type,
+        vlm_no_proxy=args.no_proxy,
         vlm_concurrency=args.vlm_concurrency,
         vlm_timeout=args.vlm_timeout,
         vlm_max_dim=args.vlm_max_dim,
